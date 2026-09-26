@@ -1,13 +1,13 @@
+"""Entry point: run the HTTP gateway locally."""
+
+from __future__ import annotations
+
 import uvicorn
-from fastapi import FastAPI
 
-app = FastAPI()
+from app.demo import build_app
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = build_app()
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
