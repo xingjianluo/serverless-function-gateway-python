@@ -8,7 +8,8 @@
 - **函数（function）**：按名称注册的本地可调用单元，如 `echo`。
 - **版本（version）**：函数下不可变的发布单元 `(function, version)`，携带
   一份固定配置 `VersionConfig{ timeout_seconds, max_concurrency }`。
-- **别名（alias）**：函数内 `alias -> version` 的指针，可原子改指。
+- **别名（alias）**：函数内 `alias -> {version: 权重%}` 的路由表，可原子
+  改指。经典“单版本别名”即 `{version: 100}` 的特例。
 - **调用目标（target）**：两类，`version:<v>` 与 `alias:<a>`，二者永不混淆。
 - **调用记录（InvocationRecord）**：`request_id / function / resolved_version /
   state / result / error / error_code / started_at / finished_at`。
@@ -107,16 +108,66 @@ GET  /requests/{request_id}    -> 当前记录快照
 
 ### 6.2 原子性
 
-- 别名指针的读写都在注册表锁内完成，读者只会看到旧版或新版，不存在中间态。
+- 别名路由表（单版本指针或权重表）的读写都在注册表锁内完成，读者
+  只会看到旧表或新表，不存在中间态。
 - request id 的“建条目 / 指纹比对 / 成为 owner”在同一套锁协议下完成，
   并发重复提交恰好选出一个 owner。
 
-### 6.3 管理端点
+### 6.3 灰度放量（加权别名）
+
+一个别名可以同时指向多个版本，每个版本一个**整数百分比权重**，全部
+权重之和必须恰好为 100。经典单版本别名 `set_alias(name, alias, v)`
+等价于 `{v: 100}`，行为与旧版完全一致。
+
+**合法性校验**（全部在写入前完成，失败不影响现有路由；原因互相可区分）：
+
+| 配置问题 | error_code | HTTP |
+|---|---|---|
+| 一个版本都没配（空表） | `ALIAS_WEIGHTS_EMPTY` | 400 |
+| 权重为负数、或非整数（含布尔、浮点） | `INVALID_WEIGHT` | 400 |
+| 权重之和 ≠ 100 | `WEIGHT_SUM_INVALID` | 400 |
+| 指向未发布的版本 | `VERSION_NOT_FOUND` | 404 |
+| 权重不是 dict / 名称为空 | `INVALID_REQUEST` | 400 |
+
+**分发规则**：
+
+- 解析在准入瞬间完成：按别名调用时在注册表锁内做**平滑加权轮询**
+  （smooth weighted round-robin），每 100 次解析严格按权重比例分布，
+  且是确定性的（便于测试与复现），随后该次调用钉在选中的版本上。
+- 权重调整**原子生效**：下一次解析要么看到旧表要么看到新表；调整
+  不需要重启服务。在途调用不受影响的机制与 6.1 的版本钉住相同——
+  它们的版本在准入时已固定，结果只记到实际执行的那个版本头上。
+- 权重 0 合法：该版本保留在路由表中但不再获得新流量，用于平滑
+  下线。在途调用照常跑完。
+
+**与并发 / 超时的相互作用**：
+
+- 分流只决定“落到哪个版本”，落点之后一切老规矩不变：每个版本各自
+  的 `max_concurrency` 与 `timeout_seconds` 照旧生效，互不影响。
+- 任何时刻某版本的在跑数 ≤ 它自己的上限，与结束方式（成功 / 失败 /
+  超时 / 限流）无关；`GET .../stats` 暴露的 `inflight` 与真实执行
+  始终对得上，长跑不漂移。
+- 幂等收敛与分流正交：同一 `request_id` 无论走别名还是直接按版本
+  提交，仍收敛为同一结论（指纹不同则 `REQUEST_CONFLICT`，见 3.3）。
+
+**可观测性**：
+
+- `GET /admin/functions/{name}/aliases/{alias}` → 当前
+  `{version: 权重}` 路由表。
+- `GET /admin/functions/{name}/stats` → 每个已发布版本的
+  `inflight`（当前在跑）、`max_concurrency`（上限）与累计终态计数
+  `succeeded / failed / timed_out / throttled`。某版本权重降为 0 后，
+  当它的 `inflight` 回到 0 且计数不再增长，即可判定“彻底没人走了”，
+  可以安全下线。
+
+### 6.4 管理端点
 
 | 端点 | 作用 |
 |---|---|
 | `POST /admin/functions/{name}/versions/{version}` | 注册不可变版本（处理器需已在本地绑定） |
-| `PUT  /admin/functions/{name}/aliases/{alias}` | 原子设置/移动别名，body: `{alias, version}`，目标版本必须已发布 |
+| `PUT  /admin/functions/{name}/aliases/{alias}` | 原子设置/移动别名。body 二选一：`{alias, version}`（单版本）或 `{alias, weights: {版本: 百分比}}`（加权）；同时给或都不给返回 400 `INVALID_REQUEST` |
+| `GET  /admin/functions/{name}/aliases/{alias}` | 查询别名当前路由表 `{version: 权重}` |
+| `GET  /admin/functions/{name}/stats` | 各版本在跑数 / 并发上限 / 累计终态计数 |
 | `POST /admin/functions/{name}/status` | 启停，body: `{"enabled": bool}` |
 
 ## 7. 状态机

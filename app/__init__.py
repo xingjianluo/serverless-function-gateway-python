@@ -2,7 +2,13 @@
 
 from .errors import GatewayError
 from .gateway import Gateway
-from .types import InvocationRecord, InvocationState, Target, VersionConfig
+from .types import (
+    InvocationRecord,
+    InvocationState,
+    Target,
+    VersionConfig,
+    VersionStats,
+)
 
 __all__ = [
     "Gateway",
@@ -11,4 +17,5 @@ __all__ = [
     "InvocationState",
     "Target",
     "VersionConfig",
+    "VersionStats",
 ]

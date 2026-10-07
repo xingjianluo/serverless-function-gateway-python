@@ -53,6 +53,24 @@ class InvalidRequestError(GatewayError):
     code = "INVALID_REQUEST"
 
 
+class AliasWeightsEmptyError(GatewayError):
+    """A weighted alias was configured with no versions at all."""
+
+    code = "ALIAS_WEIGHTS_EMPTY"
+
+
+class InvalidWeightError(GatewayError):
+    """A weight is not a non-negative integer percentage."""
+
+    code = "INVALID_WEIGHT"
+
+
+class WeightSumInvalidError(GatewayError):
+    """The weights of a weighted alias do not add up to exactly 100."""
+
+    code = "WEIGHT_SUM_INVALID"
+
+
 class RequestConflictError(GatewayError):
     """Same request id submitted with different parameters."""
 

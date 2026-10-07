@@ -16,6 +16,10 @@ Design contract
 * **Version pinning.** The concrete :class:`FunctionVersion` is resolved
   once, at admission, and stored on the entry. Alias switches or
   disable/enable afterwards cannot redirect an in-flight call.
+* **Per-version accounting.** Every admitted call is booked against the
+  resolved version's slot: ``inflight`` never exceeds the version's
+  ``max_concurrency`` on any exit path (success, error, timeout, throttle)
+  and each terminal outcome is counted exactly once.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from .types import (
     InvocationRecord,
     InvocationRequest,
     InvocationState,
+    VersionStats,
 )
 
 logger = logging.getLogger("gateway.engine")
@@ -74,10 +79,15 @@ class _Fingerprint:
 
 @dataclass
 class _Slot:
-    """Per-version concurrency accounting."""
+    """Per-version concurrency accounting and cumulative outcome counters."""
 
     semaphore: threading.Semaphore
+    max_concurrency: int
     inflight: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    timed_out: int = 0
+    throttled: int = 0
 
 
 @dataclass
@@ -165,6 +175,33 @@ class InvocationEngine:
         with self._lock:
             slot = self._slots.get((function_name, version))
             return slot.inflight if slot is not None else 0
+
+    def version_stats(self, function_name: str) -> list[VersionStats]:
+        """Per-version runtime snapshots for one function.
+
+        Covers every published version (even ones that never ran), with
+        the live in-flight count, the configured concurrency ceiling and
+        cumulative terminal-outcome counters. Raises
+        ``FUNCTION_NOT_FOUND`` for unknown functions.
+        """
+        configs = self._registry.version_configs(function_name)
+        with self._lock:
+            snapshots = []
+            for version in sorted(configs):
+                slot = self._slots.get((function_name, version))
+                snapshots.append(
+                    VersionStats(
+                        function_name=function_name,
+                        version=version,
+                        max_concurrency=configs[version].max_concurrency,
+                        inflight=slot.inflight if slot is not None else 0,
+                        succeeded=slot.succeeded if slot is not None else 0,
+                        failed=slot.failed if slot is not None else 0,
+                        timed_out=slot.timed_out if slot is not None else 0,
+                        throttled=slot.throttled if slot is not None else 0,
+                    )
+                )
+            return snapshots
 
     def shutdown(self, wait: bool = False) -> None:
         """Release the worker pool (used by tests and shutdown hooks)."""
@@ -425,6 +462,7 @@ class InvocationEngine:
             if slot is None:
                 slot = _Slot(
                     semaphore=threading.Semaphore(max_concurrency),
+                    max_concurrency=max_concurrency,
                 )
                 self._slots[key] = slot
             return slot
@@ -444,6 +482,10 @@ class InvocationEngine:
         error_code: str | None = None,
     ) -> None:
         with self._lock:
+            if entry.record.state.terminal:
+                # Defensive: a request id concludes exactly once, so the
+                # per-version outcome counters can never double-count.
+                return
             entry.record = replace(
                 entry.record,
                 state=state,
@@ -452,3 +494,15 @@ class InvocationEngine:
                 error_code=error_code,
                 finished_at=finished_at,
             )
+            fv = entry.version
+            slot = self._get_slot(
+                fv.function_name, fv.version, fv.config.max_concurrency
+            )
+            if state is InvocationState.SUCCEEDED:
+                slot.succeeded += 1
+            elif state is InvocationState.FAILED:
+                slot.failed += 1
+            elif state is InvocationState.TIMED_OUT:
+                slot.timed_out += 1
+            elif state is InvocationState.THROTTLED:
+                slot.throttled += 1

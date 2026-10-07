@@ -104,6 +104,25 @@ class InvocationRequest:
 
 
 @dataclass(frozen=True)
+class VersionStats:
+    """Point-in-time per-version runtime snapshot.
+
+    ``inflight`` is the number of executions running *right now* and must
+    never exceed ``max_concurrency``; the terminal counters are cumulative
+    since engine start and only ever grow.
+    """
+
+    function_name: str
+    version: str
+    max_concurrency: int
+    inflight: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    timed_out: int = 0
+    throttled: int = 0
+
+
+@dataclass(frozen=True)
 class InvocationRecord:
     """A point-in-time snapshot of one invocation's outcome."""
 

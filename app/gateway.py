@@ -18,6 +18,7 @@ from .types import (
     Target,
     TargetKind,
     VersionConfig,
+    VersionStats,
 )
 
 logger = logging.getLogger("gateway")
@@ -55,6 +56,16 @@ class Gateway:
     def set_alias(self, name: str, alias: str, version: str) -> None:
         """Atomically bind (or move) an alias to a published version."""
         self.registry.set_alias(name, alias, version)
+
+    def set_alias_weights(
+        self, name: str, alias: str, weights: dict[str, int]
+    ) -> None:
+        """Atomically bind an alias to several versions by percentage."""
+        self.registry.set_alias_weights(name, alias, weights)
+
+    def get_alias_weights(self, name: str, alias: str) -> dict[str, int]:
+        """Current version -> weight map of an alias."""
+        return self.registry.get_alias_weights(name, alias)
 
     def enable(self, name: str) -> None:
         self.registry.set_enabled(name, True)
@@ -105,6 +116,10 @@ class Gateway:
 
     def inflight(self, name: str, version: str) -> int:
         return self.engine.inflight_count(name, version)
+
+    def version_stats(self, name: str) -> list[VersionStats]:
+        """Per-version runtime snapshots for one function."""
+        return self.engine.version_stats(name)
 
     # -- convenience constructors -----------------------------------------
 

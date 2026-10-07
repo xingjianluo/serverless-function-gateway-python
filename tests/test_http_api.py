@@ -174,3 +174,100 @@ def test_disable_blocks_new_invocations(client: TestClient) -> None:
         json={"request_id": "http-off-2", "payload": None},
     )
     assert r2.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Weighted aliases (gray rollout) over HTTP
+# ---------------------------------------------------------------------------
+
+
+def test_weighted_alias_split_over_http(client: TestClient) -> None:
+    r = client.put(
+        "/admin/functions/echo/aliases/canary",
+        json={"alias": "canary", "weights": {"v1": 50, "v2": 50}},
+    )
+    assert r.status_code == 200
+    assert r.json()["weights"] == {"v1": 50, "v2": 50}
+
+    g = client.get("/admin/functions/echo/aliases/canary")
+    assert g.status_code == 200
+    assert g.json()["weights"] == {"v1": 50, "v2": 50}
+
+    hits: dict[str, int] = {}
+    for i in range(20):
+        resp = client.post(
+            "/functions/echo/aliases/canary/invoke",
+            json={"request_id": f"http-w-{i}", "payload": None},
+        )
+        assert resp.status_code == 200
+        hits[resp.json()["resolved_version"]] = (
+            hits.get(resp.json()["resolved_version"], 0) + 1
+        )
+    assert hits == {"v1": 10, "v2": 10}
+
+
+def test_single_version_alias_reads_as_100_percent(client: TestClient) -> None:
+    g = client.get("/admin/functions/echo/aliases/current")
+    assert g.status_code == 200
+    assert g.json()["weights"] == {"v1": 100}
+
+
+def test_invalid_weights_rejected_with_distinct_codes(
+    client: TestClient,
+) -> None:
+    url = "/admin/functions/echo/aliases/bad"
+
+    r = client.put(url, json={"alias": "bad", "weights": {"v1": 60, "v2": 60}})
+    assert r.status_code == 400
+    assert r.json()["error_code"] == "WEIGHT_SUM_INVALID"
+
+    r = client.put(url, json={"alias": "bad", "weights": {}})
+    assert r.status_code == 400
+    assert r.json()["error_code"] == "ALIAS_WEIGHTS_EMPTY"
+
+    r = client.put(
+        url, json={"alias": "bad", "weights": {"v1": -10, "v2": 110}}
+    )
+    assert r.status_code == 400
+    assert r.json()["error_code"] == "INVALID_WEIGHT"
+
+    r = client.put(
+        url, json={"alias": "bad", "weights": {"v1": 50, "v9": 50}}
+    )
+    assert r.status_code == 404
+    assert r.json()["error_code"] == "VERSION_NOT_FOUND"
+
+    r = client.put(
+        url,
+        json={"alias": "bad", "version": "v1", "weights": {"v1": 100}},
+    )
+    assert r.status_code == 400
+    assert r.json()["error_code"] == "INVALID_REQUEST"
+
+
+def test_stats_endpoint_reports_per_version_books(
+    client: TestClient,
+) -> None:
+    client.post(
+        "/functions/echo/versions/v1/invoke",
+        json={"request_id": "http-st-1", "payload": None},
+    )
+    client.post(
+        "/functions/echo/versions/v2/invoke",
+        json={"request_id": "http-st-2", "payload": None},
+    )
+    client.post(
+        "/functions/flaky/versions/v1/invoke",
+        json={"request_id": "http-st-3", "payload": None},
+    )
+    r = client.get("/admin/functions/echo/stats")
+    assert r.status_code == 200
+    versions = {v["version"]: v for v in r.json()["versions"]}
+    assert versions["v1"]["succeeded"] == 1
+    assert versions["v2"]["succeeded"] == 1
+    assert versions["v1"]["inflight"] == 0
+    assert versions["v1"]["max_concurrency"] == 8
+
+    r = client.get("/admin/functions/flaky/stats")
+    versions = {v["version"]: v for v in r.json()["versions"]}
+    assert versions["v1"]["failed"] == 1
