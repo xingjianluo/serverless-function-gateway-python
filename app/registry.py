@@ -15,6 +15,7 @@ Guarantees:
 from __future__ import annotations
 
 import logging
+import random
 import threading
 from typing import Any, Callable
 
@@ -23,8 +24,11 @@ from .errors import (
     FunctionDisabledError,
     FunctionNotFoundError,
     InvalidRequestError,
+    RoutingEmptyError,
     VersionAlreadyExistsError,
     VersionNotFoundError,
+    WeightNegativeError,
+    WeightSumInvalidError,
 )
 from .types import FunctionVersion, Target, TargetKind, VersionConfig
 
@@ -34,14 +38,18 @@ logger = logging.getLogger("gateway.registry")
 class FunctionRegistry:
     """Thread-safe registry of immutable function versions and aliases."""
 
-    def __init__(self) -> None:
+    def __init__(self, rng: random.Random | None = None) -> None:
         self._lock = threading.RLock()
         # function_name -> version -> FunctionVersion
         self._versions: dict[str, dict[str, FunctionVersion]] = {}
-        # function_name -> alias -> version
-        self._aliases: dict[str, dict[str, str]] = {}
+        # function_name -> alias -> {version: weight_percent}
+        # A classic single-version alias is stored as {version: 100}.
+        self._aliases: dict[str, dict[str, dict[str, int]]] = {}
         # function_name -> enabled flag (absent means never registered)
         self._enabled: dict[str, bool] = {}
+        # Weighted picks happen under self._lock; one Random keeps the
+        # selection reproducible in tests and off the global module state.
+        self._rng = rng or random.Random()
 
     # -- registration ------------------------------------------------------
 
@@ -131,8 +139,8 @@ class FunctionRegistry:
                     )
             elif target.kind is TargetKind.ALIAS:
                 aliases = self._aliases.get(function_name, {})
-                pointed = aliases.get(target.name)
-                if pointed is None:
+                weights = aliases.get(target.name)
+                if weights is None:
                     raise AliasNotFoundError(
                         f"alias {target.name!r} of {function_name!r} "
                         "does not exist",
@@ -141,6 +149,7 @@ class FunctionRegistry:
                             "alias": target.name,
                         },
                     )
+                pointed = self._pick_weighted(weights)
                 fv = versions.get(pointed)
                 if fv is None:  # defensive: versions can never be deleted
                     raise VersionNotFoundError(
@@ -150,6 +159,15 @@ class FunctionRegistry:
                             "function": function_name,
                             "version": pointed,
                         },
+                    )
+                if len(weights) > 1:
+                    logger.info(
+                        "registry.weighted_pick function=%s alias=%s "
+                        "weights=%s chosen=%s reason=weighted_alias_resolved",
+                        function_name,
+                        target.name,
+                        weights,
+                        pointed,
                     )
             else:  # pragma: no cover - exhaustive enum
                 raise InvalidRequestError(f"unknown target kind: {target.kind!r}")
@@ -200,7 +218,10 @@ class FunctionRegistry:
         )
 
     def set_alias(self, function_name: str, alias: str, version: str) -> None:
-        """Point an alias at a registered version (atomic switch)."""
+        """Point an alias at a registered version (atomic switch).
+
+        Equivalent to ``set_alias_weights(..., {version: 100})``.
+        """
         self._validate_names(function_name, alias)
         with self._lock:
             versions = self._versions.get(function_name)
@@ -216,18 +237,97 @@ class FunctionRegistry:
                     detail={"function": function_name, "version": version},
                 )
             old = self._aliases.get(function_name, {}).get(alias)
-            self._aliases.setdefault(function_name, {})[alias] = version
+            self._aliases.setdefault(function_name, {})[alias] = {
+                version: 100
+            }
         logger.info(
             "registry.alias_switch function=%s alias=%s %s->%s "
             "reason=explicit_set_alias atomic=true",
             function_name,
             alias,
             old,
-            version,
+            {version: 100},
         )
 
     def get_alias(self, function_name: str, alias: str) -> str:
-        """Return the version an alias currently points at."""
+        """Return the version an alias currently points at.
+
+        Only valid for single-version aliases; a weighted alias must be
+        read with :meth:`get_alias_weights`.
+        """
+        with self._lock:
+            weights = self._alias_weights_locked(function_name, alias)
+            if len(weights) != 1:
+                raise InvalidRequestError(
+                    f"alias {alias!r} of {function_name!r} splits traffic "
+                    "across several versions; use get_alias_weights",
+                    detail={
+                        "function": function_name,
+                        "alias": alias,
+                        "weights": dict(weights),
+                    },
+                )
+            return next(iter(weights))
+
+    # -- weighted routing (grey rollout) ------------------------------------
+
+    def set_alias_weights(
+        self, function_name: str, alias: str, weights: dict[str, int]
+    ) -> None:
+        """Point an alias at several versions with integer percentages.
+
+        The weights must sum to exactly 100; a 0-weight version keeps its
+        in-flight calls but receives no new traffic. Takes effect
+        immediately for new resolutions.
+
+        Rejection codes (all distinguishable):
+        * ``ROUTING_EMPTY``      -- no version configured at all
+        * ``WEIGHT_NEGATIVE``    -- a weight below 0
+        * ``WEIGHT_SUM_INVALID`` -- weights do not add up to exactly 100
+        * ``VERSION_NOT_FOUND``  -- a weight targets an unpublished version
+        * ``INVALID_REQUEST``    -- non-integer weight / bad names
+        """
+        self._validate_names(function_name, alias)
+        if not isinstance(weights, dict) or not weights:
+            raise RoutingEmptyError(
+                f"alias {alias!r} of {function_name!r} must route to at "
+                "least one version",
+                detail={"function": function_name, "alias": alias},
+            )
+        for version, weight in weights.items():
+            if (
+                isinstance(weight, bool)
+                or not isinstance(weight, int)
+                or weight > 100
+            ):
+                raise InvalidRequestError(
+                    f"weight for {function_name}:{version} must be an "
+                    f"integer in [0, 100], got {weight!r}",
+                    detail={"function": function_name, "version": version},
+                )
+            if weight < 0:
+                raise WeightNegativeError(
+                    f"weight for {function_name}:{version} must not be "
+                    f"negative, got {weight}",
+                    detail={
+                        "function": function_name,
+                        "version": version,
+                        "weight": weight,
+                    },
+                )
+        total = sum(weights.values())
+        if total != 100:
+            raise WeightSumInvalidError(
+                f"weights for alias {alias!r} of {function_name!r} add up "
+                f"to {total}, expected exactly 100",
+                detail={
+                    "function": function_name,
+                    "alias": alias,
+                    "weights": dict(weights),
+                    "sum": total,
+                },
+            )
+
         with self._lock:
             versions = self._versions.get(function_name)
             if versions is None:
@@ -235,13 +335,49 @@ class FunctionRegistry:
                     f"function {function_name!r} is not registered",
                     detail={"function": function_name},
                 )
-            pointed = self._aliases.get(function_name, {}).get(alias)
-            if pointed is None:
-                raise AliasNotFoundError(
-                    f"alias {alias!r} of {function_name!r} does not exist",
-                    detail={"function": function_name, "alias": alias},
+            for version in weights:
+                if version not in versions:
+                    raise VersionNotFoundError(
+                        f"cannot route alias {alias!r} to unpublished "
+                        f"{function_name}:{version}",
+                        detail={"function": function_name, "version": version},
+                    )
+            old = self._aliases.get(function_name, {}).get(alias)
+            snapshot = dict(weights)
+            self._aliases.setdefault(function_name, {})[alias] = snapshot
+        logger.info(
+            "registry.alias_weights function=%s alias=%s %s->%s "
+            "reason=explicit_set_alias_weights atomic=true "
+            "scope=new_invocations_only",
+            function_name,
+            alias,
+            old,
+            snapshot,
+        )
+
+    def get_alias_weights(
+        self, function_name: str, alias: str
+    ) -> dict[str, int]:
+        """Return the current {version: weight} map of an alias."""
+        with self._lock:
+            return dict(self._alias_weights_locked(function_name, alias))
+
+    def list_alias_weights(
+        self, function_name: str
+    ) -> dict[str, dict[str, int]]:
+        """Return every alias of a function as {alias: {version: weight}}."""
+        with self._lock:
+            if function_name not in self._versions:
+                raise FunctionNotFoundError(
+                    f"function {function_name!r} is not registered",
+                    detail={"function": function_name},
                 )
-            return pointed
+            return {
+                alias: dict(weights)
+                for alias, weights in self._aliases.get(
+                    function_name, {}
+                ).items()
+            }
 
     # -- introspection -----------------------------------------------------
 
@@ -256,19 +392,76 @@ class FunctionRegistry:
             return sorted(versions)
 
     def list_aliases(self, function_name: str) -> dict[str, str]:
+        """Single-version aliases as {alias: version} (legacy view).
+
+        Aliases that split traffic across versions are omitted here; use
+        :meth:`list_alias_weights` for the complete view.
+        """
         with self._lock:
             if function_name not in self._versions:
                 raise FunctionNotFoundError(
                     f"function {function_name!r} is not registered",
                     detail={"function": function_name},
                 )
-            return dict(self._aliases.get(function_name, {}))
+            return {
+                alias: next(iter(weights))
+                for alias, weights in self._aliases.get(
+                    function_name, {}
+                ).items()
+                if len(weights) == 1
+            }
+
+    def version_configs(self, function_name: str) -> dict[str, VersionConfig]:
+        """Snapshot of {version: config} for every published version."""
+        with self._lock:
+            versions = self._versions.get(function_name)
+            if versions is None:
+                raise FunctionNotFoundError(
+                    f"function {function_name!r} is not registered",
+                    detail={"function": function_name},
+                )
+            return {v: fv.config for v, fv in versions.items()}
 
     def is_enabled(self, function_name: str) -> bool:
         with self._lock:
             return self._enabled.get(function_name, False)
 
     # -- helpers -----------------------------------------------------------
+
+    def _alias_weights_locked(
+        self, function_name: str, alias: str
+    ) -> dict[str, int]:
+        """Read an alias weight map; caller must hold ``self._lock``."""
+        versions = self._versions.get(function_name)
+        if versions is None:
+            raise FunctionNotFoundError(
+                f"function {function_name!r} is not registered",
+                detail={"function": function_name},
+            )
+        weights = self._aliases.get(function_name, {}).get(alias)
+        if weights is None:
+            raise AliasNotFoundError(
+                f"alias {alias!r} of {function_name!r} does not exist",
+                detail={"function": function_name, "alias": alias},
+            )
+        return weights
+
+    def _pick_weighted(self, weights: dict[str, int]) -> str:
+        """Choose a version proportionally to its weight.
+
+        A 0-weight version spans an empty interval and is never chosen,
+        so draining a version takes effect immediately for new calls.
+        Caller must hold ``self._lock`` (keeps the rng single-threaded).
+        """
+        roll = self._rng.random() * 100.0
+        cumulative = 0.0
+        chosen = ""
+        for version in sorted(weights):
+            cumulative += weights[version]
+            chosen = version
+            if roll < cumulative:
+                break
+        return chosen
 
     @staticmethod
     def _validate_names(function_name: str, version_or_alias: str) -> None:

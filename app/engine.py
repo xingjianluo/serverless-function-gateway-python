@@ -78,6 +78,9 @@ class _Slot:
 
     semaphore: threading.Semaphore
     inflight: int = 0
+    # Terminal-state histogram; every admitted request ends in exactly
+    # one terminal state, so sum(terminal.values()) counts conclusions.
+    terminal: dict[InvocationState, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -165,6 +168,28 @@ class InvocationEngine:
         with self._lock:
             slot = self._slots.get((function_name, version))
             return slot.inflight if slot is not None else 0
+
+    def version_stats(
+        self, function_name: str, version: str
+    ) -> dict[str, Any] | None:
+        """Runtime counters for one version.
+
+        Returns ``{"inflight": int, "terminal": {state: count}}`` or
+        ``None`` if the version never ran on this engine.
+        """
+        with self._lock:
+            slot = self._slots.get((function_name, version))
+            if slot is None:
+                return None
+            return {
+                "inflight": slot.inflight,
+                "terminal": {
+                    state.value: count
+                    for state, count in sorted(
+                        slot.terminal.items(), key=lambda kv: kv[0].value
+                    )
+                },
+            }
 
     def shutdown(self, wait: bool = False) -> None:
         """Release the worker pool (used by tests and shutdown hooks)."""
@@ -257,12 +282,17 @@ class InvocationEngine:
                 "invoke.background_crash request_id=%s", request.request_id
             )
             if not entry.record.state.terminal:
+                fv = entry.version
+                slot = self._get_slot(
+                    fv.function_name, fv.version, fv.config.max_concurrency
+                )
                 self._finish(
                     entry,
                     state=InvocationState.FAILED,
                     error=f"{type(exc).__name__}: {exc}",
                     error_code="HANDLER_ERROR",
                     finished_at=time.monotonic(),
+                    slot=slot,
                 )
                 entry.owner_active = False
                 entry.done.set()
@@ -284,6 +314,7 @@ class InvocationEngine:
                 ),
                 error_code="THROTTLED",
                 finished_at=time.monotonic(),
+                slot=slot,
             )
             self._close_owner(entry)
             logger.info(
@@ -329,6 +360,7 @@ class InvocationEngine:
                     error=f"executor unavailable: {exc}",
                     error_code="EXECUTOR_SHUTDOWN",
                     finished_at=time.monotonic(),
+                    slot=slot,
                 )
                 return entry.record
 
@@ -347,6 +379,7 @@ class InvocationEngine:
                         error=f"{type(exc).__name__}: {exc}",
                         error_code="HANDLER_ERROR",
                         finished_at=time.monotonic(),
+                        slot=slot,
                     )
                     logger.info(
                         "invoke.failed request_id=%s version=%s "
@@ -361,6 +394,7 @@ class InvocationEngine:
                         state=InvocationState.SUCCEEDED,
                         result=result,
                         finished_at=time.monotonic(),
+                        slot=slot,
                     )
                     logger.info(
                         "invoke.succeeded request_id=%s version=%s "
@@ -381,6 +415,7 @@ class InvocationEngine:
                     ),
                     error_code="TIMED_OUT",
                     finished_at=time.monotonic(),
+                    slot=slot,
                 )
                 logger.info(
                     "invoke.timed_out request_id=%s version=%s "
@@ -439,6 +474,7 @@ class InvocationEngine:
         *,
         state: InvocationState,
         finished_at: float,
+        slot: _Slot | None = None,
         result: Any = None,
         error: str | None = None,
         error_code: str | None = None,
@@ -452,3 +488,7 @@ class InvocationEngine:
                 error_code=error_code,
                 finished_at=finished_at,
             )
+            if slot is not None:
+                # Exactly one terminal conclusion per admitted request id:
+                # _finish is only ever called once per entry.
+                slot.terminal[state] = slot.terminal.get(state, 0) + 1

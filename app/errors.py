@@ -53,6 +53,28 @@ class InvalidRequestError(GatewayError):
     code = "INVALID_REQUEST"
 
 
+class RoutingConfigError(GatewayError):
+    """Base class for invalid weighted-routing configurations."""
+
+
+class RoutingEmptyError(RoutingConfigError):
+    """A weighted alias was configured with no versions at all."""
+
+    code = "ROUTING_EMPTY"
+
+
+class WeightSumInvalidError(RoutingConfigError):
+    """The weights of a weighted alias do not add up to exactly 100."""
+
+    code = "WEIGHT_SUM_INVALID"
+
+
+class WeightNegativeError(RoutingConfigError):
+    """A weighted alias contained a negative weight."""
+
+    code = "WEIGHT_NEGATIVE"
+
+
 class RequestConflictError(GatewayError):
     """Same request id submitted with different parameters."""
 

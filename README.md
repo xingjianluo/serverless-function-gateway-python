@@ -8,6 +8,10 @@
 - 同步调用与可轮询结果的异步调用；同一 `request_id` 重复提交收敛为同一结论。
 - 并发超限立即拒绝（`THROTTLED`，不排队）；超时立即定案（`TIMED_OUT`，不拖垮服务）。
 - 别名原子切换、函数可启停；在途调用固定在准入时解析到的版本上，不串版、不丢结果。
+- 别名可配 **多版本整数百分比权重**（合计恰为 100）做灰度放量：在线调整即时生效，
+  份额降为 0 平滑排空；非法配置（空表 / 合计≠100 / 负权重 / 未发布版本）分别拒绝。
+- 每个版本独立记账：并发上限、超时预算、在跑数与各终态累计互不影响，
+  可通过总览接口实时查询，判断版本是否已排空、能否安全下线。
 - 执行结束后并发计数即时回收；超时的“迟到返回”无法改写已定案的结论。
 
 ## 目录结构
@@ -22,7 +26,7 @@ app/
   http_api.py   # FastAPI 传输层
   demo.py       # 内置本地函数绑定表
 main.py         # uvicorn 入口
-tests/          # 35 个单测（并发 / 超时 / 去重 / 版本冲突 / 生命周期）
+tests/          # 50 个单测（并发 / 超时 / 去重 / 版本冲突 / 生命周期 / 权重分流）
 docs/protocol.md# 协议与语义的详细说明
 ```
 
@@ -68,6 +72,27 @@ curl -s -X POST http://127.0.0.1:8000/admin/functions/echo/status \
   -H 'Content-Type: application/json' -d '{"enabled":false}'
 ```
 
+灰度放量（权重分流）与排空观察：
+
+```bash
+# 90% 留在 v1，10% 放到 v2；改完立即对新调用生效，无需重启
+curl -s -X PUT http://127.0.0.1:8000/admin/functions/echo/aliases/current \
+  -H 'Content-Type: application/json' \
+  -d '{"alias":"current","weights":{"v1":90,"v2":10}}'
+
+# 查看各版本份额、在跑数/上限、各终态累计，判断旧版本是否已排空
+curl -s http://127.0.0.1:8000/functions/echo/overview
+
+# 确认 v1 的 inflight 为 0 后，把它的份额降到 0，平滑完成下线
+curl -s -X PUT http://127.0.0.1:8000/admin/functions/echo/aliases/current \
+  -H 'Content-Type: application/json' \
+  -d '{"alias":"current","weights":{"v1":0,"v2":100}}'
+```
+
+非法权重配置会被明确拒绝且原因可区分：空表 `ROUTING_EMPTY`、
+合计≠100 `WEIGHT_SUM_INVALID`、负权重 `WEIGHT_NEGATIVE`（均 400）、
+指向未发布版本 `VERSION_NOT_FOUND`(404)；被拒绝时别名维持原配置不变。
+
 ## 在代码中直接使用
 
 ```python
@@ -102,14 +127,15 @@ assert again is record
 准入阶段拒绝（HTTP 响应体 `error_code`）：
 `VERSION_ALREADY_EXISTS`(409)、`REQUEST_CONFLICT`(409)、
 `FUNCTION_DISABLED`(409)、`FUNCTION_NOT_FOUND`/`VERSION_NOT_FOUND`/
-`ALIAS_NOT_FOUND`(404)、`INVALID_REQUEST`(400)。
+`ALIAS_NOT_FOUND`(404)、`INVALID_REQUEST`(400)、
+权重分流配置非法：`ROUTING_EMPTY`/`WEIGHT_SUM_INVALID`/`WEIGHT_NEGATIVE`(400)。
 
 完整语义见 [`docs/protocol.md`](docs/protocol.md)。
 
 ## 验证方法
 
 ```bash
-uv run pytest                      # 35 个单测
+uv run pytest                      # 50 个单测
 uv run pytest --log-cli-level=INFO # 实时打印 request_id 与状态迁移依据
 ```
 
@@ -125,6 +151,15 @@ uv run pytest --log-cli-level=INFO # 实时打印 request_id 与状态迁移依�
 | 别名切换期间在途调用固定旧版本，新调用走新版本 | `test_inflight_call_pinned_across_alias_switch` |
 | 下线不影响在途结果，恢复后可继续调用 | `test_disable_does_not_lose_inflight_and_blocks_new` |
 | 混合压力后并发计数零漂移 | `test_concurrency_counters_have_no_drift_after_mixed_load` |
+| 按权重分发的实际结果分布（75/25，容差断言） | `tests/test_weighted.py::test_traffic_splits_proportionally_to_weights` |
+| 非法权重配置分别拒绝（空表/合计≠100/负权重/未发布版本/非整数） | `test_empty_routing_rejected_distinctly` 等 5 个用例 |
+| 调比例立即生效、份额降 0 平滑排空 | `test_weight_change_applies_immediately_and_zero_drains` |
+| 调比例期间在途调用钉住旧版本、结果计入旧版本 | `test_inflight_call_pinned_and_accounted_during_weight_shift` |
+| 超时等异常结束下并发上限仍是真上限、计数不漂移 | `test_concurrency_cap_holds_under_timeouts_and_no_drift` |
+| 混合结局下终态累计与准入数严格相等 | `test_terminal_counters_match_admissions_across_mixed_outcomes` |
+| 权重别名下重复 request_id 仍收敛、处理器只跑一次 | `test_duplicate_request_id_converges_across_weighted_alias` |
+| 单版本别名与直接按版本调用行为不变 | `test_single_version_alias_and_direct_version_unaffected` |
+| HTTP 权重配置与总览端点、非法权重 400 且码可区分 | `test_http_weighted_alias_and_overview`、`test_http_invalid_weights_map_to_400_with_distinct_codes` |
 
 单测日志样例（每次迁移都带 request id 与 reason）：
 

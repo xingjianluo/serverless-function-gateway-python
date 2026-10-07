@@ -8,7 +8,9 @@
 - **函数（function）**：按名称注册的本地可调用单元，如 `echo`。
 - **版本（version）**：函数下不可变的发布单元 `(function, version)`，携带
   一份固定配置 `VersionConfig{ timeout_seconds, max_concurrency }`。
-- **别名（alias）**：函数内 `alias -> version` 的指针，可原子改指。
+- **别名（alias）**：函数内 `alias -> {version: weight}` 的路由表，可原子
+  改指。权重为整数百分比，合计必须恰好 100；只有一个版本时退化为
+  `{version: 100}`，即经典的单版本别名。
 - **调用目标（target）**：两类，`version:<v>` 与 `alias:<a>`，二者永不混淆。
 - **调用记录（InvocationRecord）**：`request_id / function / resolved_version /
   state / result / error / error_code / started_at / finished_at`。
@@ -66,13 +68,72 @@ GET  /requests/{request_id}    -> 当前记录快照
 - 准入前被拒绝的请求不占用 request id（例如函数下线期间投递被拒，
   函数恢复后可用同一 id 重新提交）。
 
-> 注意：按别名调用时，指纹包含别名本身而非解析后的版本。切换别名后用同一
-> request id 重试属于不同请求，这保证“切换后重试”不会被旧结论吞掉。
+> 注意：按别名调用时，指纹包含别名本身而非解析后的版本。切换别名（含调整
+> 权重）后用同一 request id 重试属于不同请求，这保证“切换后重试”不会被旧
+> 结论吞掉。权重分流不改变收敛语义：同一 request id 的重复提交无论被随机
+> 分到哪个版本，都附着到首次准入时钉住的版本，收敛为同一份记录。
+
+## 3.4 权重分流（灰度放量）
+
+一个别名可以同时指向多个版本，每个版本一个整数百分比权重：
+
+```
+PUT /admin/functions/{name}/aliases/{alias}
+{ "alias": "current", "weights": { "v1": 90, "v2": 10 } }
+```
+
+- **按比例分发**：每次准入时在注册表锁内做一次加权随机选择，请求按
+  权重比例落到不同版本；被选中的版本即钉在本次调用的
+  `resolved_version` 上（见 6.1）。
+- **在线生效**：权重调整是原子换表，无需重启；调整之后的新调用立即
+  按新比例走，在途调用继续跑准入时的版本，结果只计入该版本的计数。
+- **平滑下线**：把某版本权重调为 0，它立即不再获得新流量，在途调用
+  照常跑完；观察总览接口确认 `inflight == 0` 后即可安全停用。
+- **非法配置全部拒绝且原因可区分**（HTTP 状态 + error_code）：
+
+  | 配置 | error_code | HTTP |
+  |---|---|---|
+  | 一个版本都没配（空表） | `ROUTING_EMPTY` | 400 |
+  | 权重合计 ≠ 100 | `WEIGHT_SUM_INVALID` | 400 |
+  | 权重为负数 | `WEIGHT_NEGATIVE` | 400 |
+  | 指向未发布版本 | `VERSION_NOT_FOUND` | 404 |
+  | 权重非整数 / 超出 [0,100] / 名称非法 | `INVALID_REQUEST` | 400 |
+
+  被拒绝的配置不会落库：别名保持调整前的路由表不变。
+- **兼容关系**：`set_alias` / `{ "version": "v1" }` 的单版本写法等价于
+  `{ "v1": 100 }`，直接按版本调用完全不经过权重逻辑；两者行为与引入
+  分流前一致。
+
+### 3.5 运行总览（判断版本是否已排空）
+
+```
+GET /functions/{name}/overview
+```
+
+返回每个别名的当前权重表，以及每个版本的实时账目：
+
+```json
+{
+  "function": "echo",
+  "enabled": true,
+  "aliases": { "current": { "v1": 90, "v2": 10 } },
+  "versions": {
+    "v1": { "inflight": 2, "max_concurrency": 8, "timeout_seconds": 2.0,
+            "terminal": { "SUCCEEDED": 41, "TIMED_OUT": 1 } },
+    "v2": { "inflight": 0, "max_concurrency": 8, "timeout_seconds": 2.0,
+            "terminal": { "SUCCEEDED": 5 } }
+  }
+}
+```
+
+`inflight` 是该版本**此刻真正在跑**的调用数（与槽位计数同源，正常
+返回、报错、超时都会即时回收，不漂移）；`terminal` 是各终态的累计
+结论数。某版本权重为 0 且 `inflight` 为 0，即表示它已彻底没人走。
 
 ## 4. 并发规则
 
 1. 每个**具体版本**有独立的并发计数器与容量为 `max_concurrency` 的槽位；
-   不同版本（即使属于同一函数）互不影响。
+   不同版本（即使属于同一函数、同一别名分流到的流量）互不影响。
 2. 准入时槽位获取为**非阻塞**：拿不到立即终态 `THROTTLED`
    （`error_code=THROTTLED`，HTTP 429）。**不做静默排队**。
 3. 槽位在执行作用域结束时（成功 / 失败 / 超时 / 提交通道失败）于
@@ -80,7 +141,11 @@ GET  /requests/{request_id}    -> 当前记录快照
 4. 超时的处理器线程可能稍后才真正结束，但槽位在**超时判定的那一刻**
    即回收，不会被迟到返回继续占用（日志：`invoke.reclaim ...
    reason=execution_scope_closed`）。
-5. 线程池是全局天花板（默认 256 个工作线程），正常路径下由各版本
+5. 每次定案（含 `THROTTLED`）在对应版本的终态直方图上累计一次；
+   一个被准入的 request id 恰好产生一条终态计数，因此
+   `sum(terminal)` 恒等于该版本定案过的请求数，`inflight` 恒等于
+   真实在跑数——压测再久也不漂移（见 3.5 总览接口）。
+6. 线程池是全局天花板（默认 256 个工作线程），正常路径下由各版本
    `max_concurrency` 先行限流，避免无限创建线程。
 
 ## 5. 超时规则
@@ -100,8 +165,9 @@ GET  /requests/{request_id}    -> 当前记录快照
 调用在**准入瞬间**把目标解析成具体版本对象并保存在调用记录上
 （`resolved_version`），之后整个执行过程只引用该对象。因此：
 
-- 别名在执行期间被切换：在途调用继续跑旧版本，结果写回旧版本的执行，
-  不会串入新版本；切换之后的新调用解析到新版本。
+- 别名在执行期间被切换（含权重调整、份额降为 0）：在途调用继续跑旧版本，
+  结果写回旧版本的执行与计数，不会串入新版本；切换之后的新调用按新
+  路由表解析。
 - 函数被下线：在途调用不受影响、结果不丢失；下线只拦截**新准入**，
   新调用得到 `FUNCTION_DISABLED`（409）。重新启用后恢复正常。
 
@@ -116,8 +182,9 @@ GET  /requests/{request_id}    -> 当前记录快照
 | 端点 | 作用 |
 |---|---|
 | `POST /admin/functions/{name}/versions/{version}` | 注册不可变版本（处理器需已在本地绑定） |
-| `PUT  /admin/functions/{name}/aliases/{alias}` | 原子设置/移动别名，body: `{alias, version}`，目标版本必须已发布 |
+| `PUT  /admin/functions/{name}/aliases/{alias}` | 原子设置/移动别名：body `{alias, version}` 为单版本， `{alias, weights:{v:w}}` 为权重分流；目标版本必须已发布 |
 | `POST /admin/functions/{name}/status` | 启停，body: `{"enabled": bool}` |
+| `GET  /functions/{name}/overview` | 各别名权重表 + 各版本 inflight/上限/终态累计（见 3.5） |
 
 ## 7. 状态机
 
@@ -145,6 +212,8 @@ invoke.reclaim    ... reason=execution_scope_closed
 
 注册表侧：`registry.register ... reason=first_registration_immutable`、
 `registry.alias_switch ... atomic=true`、
+`registry.alias_weights ... scope=new_invocations_only`（权重换表）、
+`registry.weighted_pick ... weights={...} chosen=<v>`（每次分流选择）、
 `registry.reject ... reason=function_disabled`。
 
 ## 8. 可复现性说明

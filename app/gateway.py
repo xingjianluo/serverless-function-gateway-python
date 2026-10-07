@@ -56,6 +56,41 @@ class Gateway:
         """Atomically bind (or move) an alias to a published version."""
         self.registry.set_alias(name, alias, version)
 
+    def set_alias_weights(
+        self, name: str, alias: str, weights: dict[str, int]
+    ) -> None:
+        """Bind an alias to several versions with integer percentages."""
+        self.registry.set_alias_weights(name, alias, weights)
+
+    def function_overview(self, name: str) -> dict[str, Any]:
+        """Snapshot of a function's aliases, weights and per-version stats.
+
+        The ``versions`` map tells, for every published version, how many
+        calls are running right now versus its own cap, and how many calls
+        ended in each terminal state -- enough to decide whether a version
+        has fully drained and can be retired safely.
+        """
+        configs = self.registry.version_configs(name)
+        aliases = self.registry.list_alias_weights(name)
+        versions: dict[str, Any] = {}
+        for version, cfg in sorted(configs.items()):
+            stats = self.engine.version_stats(name, version) or {
+                "inflight": 0,
+                "terminal": {},
+            }
+            versions[version] = {
+                "inflight": stats["inflight"],
+                "max_concurrency": cfg.max_concurrency,
+                "timeout_seconds": cfg.timeout_seconds,
+                "terminal": stats["terminal"],
+            }
+        return {
+            "function": name,
+            "enabled": self.registry.is_enabled(name),
+            "aliases": aliases,
+            "versions": versions,
+        }
+
     def enable(self, name: str) -> None:
         self.registry.set_enabled(name, True)
 

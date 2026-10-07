@@ -34,6 +34,9 @@ _STATE_STATUS = {
 
 _ERROR_STATUS = {
     "INVALID_REQUEST": 400,
+    "ROUTING_EMPTY": 400,
+    "WEIGHT_NEGATIVE": 400,
+    "WEIGHT_SUM_INVALID": 400,
     "VERSION_ALREADY_EXISTS": 409,
     "REQUEST_CONFLICT": 409,
     "FUNCTION_NOT_FOUND": 404,
@@ -56,7 +59,8 @@ class RegisterBody(BaseModel):
 
 class AliasBody(BaseModel):
     alias: str = Field(min_length=1)
-    version: str = Field(min_length=1)
+    version: str | None = Field(default=None, min_length=1)
+    weights: dict[str, int] | None = None
 
 
 class InvokeBody(BaseModel):
@@ -156,8 +160,25 @@ def create_app(gateway: Gateway | None = None) -> FastAPI:
 
     @app.put("/admin/functions/{name}/aliases/{alias}")
     def set_alias(name: str, alias: str, body: AliasBody) -> dict[str, Any]:
+        if body.weights is not None:
+            app.state.gateway.set_alias_weights(name, alias, body.weights)
+            return {"function": name, "alias": alias, "weights": body.weights}
+        if body.version is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error_code": "INVALID_REQUEST",
+                    "message": "provide either 'version' or 'weights'",
+                    "detail": {"function": name, "alias": alias},
+                },
+            )
         app.state.gateway.set_alias(name, alias, body.version)
         return {"function": name, "alias": alias, "version": body.version}
+
+    @app.get("/functions/{name}/overview")
+    def function_overview(name: str) -> dict[str, Any]:
+        """Weights per alias plus per-version inflight/limit/terminal counts."""
+        return app.state.gateway.function_overview(name)
 
     @app.post("/admin/functions/{name}/status")
     async def set_status(name: str, request: Request) -> dict[str, Any]:
